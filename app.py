@@ -16,39 +16,25 @@ def init_clients():
     
     pc = pinecone.Pinecone(api_key=key)
 
-def get_text_embedding(text: str) -> np.ndarray:
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/BiomedVLP-CXR-BERT-general")
-    bert_model = AutoModel.from_pretrained("microsoft/BiomedVLP-CXR-BERT-general")
-    inp = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-    with torch.no_grad():
-        out = bert_model(**inp)
-        emb = out.last_hidden_state[:,0,:]
-        emb = emb / emb.norm(dim=-1, keepdim=True)
-    return emb.squeeze().cpu().numpy().astype(np.float32)
+from sentence_transformers import SentenceTransformer
+clip = SentenceTransformer("clip-ViT-B-32")
 
-def get_image_embedding(image_bytes: bytes) -> np.ndarray:
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("clip-ViT-B-32")
+def get_image_embedding(image_bytes):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    emb = model.encode(img, convert_to_numpy=True)
+    emb = clip.encode(img, convert_to_numpy=True, normalize_embeddings=True)
     return emb.astype(np.float32)
 
+def get_text_embedding(text):
+    emb = clip.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+    return emb.astype(np.float32)
+
+def normalize(v: np.ndarray) -> np.ndarray:
+    return v / (np.linalg.norm(v) + 1e-12)
+
 def combine_embeddings(img_emb: Optional[np.ndarray], txt_emb: Optional[np.ndarray], w_img: float, w_txt: float) -> np.ndarray:
-    if img_emb is None and txt_emb is None:
-        raise ValueError("At least one modality is required")
-    if img_emb is None:
-        v = txt_emb / np.linalg.norm(txt_emb)
-        return v
-    if txt_emb is None:
-        v = img_emb / np.linalg.norm(img_emb)
-        return v
-    st.info(f"Image emb norm before weighting: {img_emb.shape}  {np.linalg.norm(img_emb)}")
-    v = np.concatenate([txt_emb, img_emb])
-    if np.linalg.norm(v) == 0:
-        return v
-    return (v / np.linalg.norm(v)).astype(np.float32)
-    # final_vec = np.concatenate([txt_emb, img_emb])
-    # return final_vec.astype(np.float32)
+    final_vec = normalize(w_img * img_emb + w_txt * txt_emb)
+
+    return final_vec.astype(np.float32)
 
 import json
 import streamlit as st
@@ -183,13 +169,56 @@ def format_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
         "image_url": meta.get("image_url"),
         "report": meta.get("report")
     }
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    return float(np.dot(a, b))
 
-def render_results(results: Any):
+def rerank_hits_with_report_embeddings(query_img_emb: Optional[np.ndarray], query_txt_emb: Optional[np.ndarray], hits: List[Dict[str,Any]], get_text_embedding_fn, alpha: float = 0.5) -> List[Dict[str,Any]]:
+    reranked = []
+    for hit in hits:
+        meta = hit.get("metadata", {}) or {}
+        report = meta.get("report_text", "") or ""
+        report_emb = get_text_embedding_fn(report) if report else None
+        img_sim = 0.0
+        if query_img_emb is not None:
+            if meta.get("img_emb") is not None:
+                try:
+                    img_meta_emb = np.array(meta.get("img_emb"), dtype=np.float32)
+                    img_sim = cosine(query_img_emb, img_meta_emb)
+                except Exception:
+                    img_sim = 0.0
+            elif "vector" in hit and hit.get("vector") is not None:
+                try:
+                    vec = np.array(hit["vector"], dtype=np.float32)
+                    # vector in index might be concatenated; avoid assuming shape — use fallback 0
+                    img_sim = 0.0
+                except Exception:
+                    img_sim = 0.0
+        txt_sim = 0.0
+        if query_txt_emb is not None and report_emb is not None:
+            txt_sim = cosine(query_txt_emb, report_emb)
+        combined = alpha * img_sim + (1.0 - alpha) * txt_sim
+        reranked.append((combined, hit))
+    reranked.sort(key=lambda x: x[0], reverse=True)
+    st.info(reranked)
+    return [h for score,h in reranked]
+
+
+def render_results(results: Any, query_img_emb: Optional[np.ndarray], query_txt_emb: Optional[np.ndarray], rerank_alpha: float):
+
     matches = results.get("matches", []) if isinstance(results, dict) else results["matches"]
-    for m in matches:
-       
+    if not matches:
+        st.info("No matches returned")
+        return
+    hits_for_rerank = matches
+    
+    reranked = rerank_hits_with_report_embeddings(query_img_emb, query_txt_emb, hits_for_rerank, get_text_embedding, alpha=rerank_alpha)
+    # except Exception as e:
+    #     st.warning(f"Rerank failed: {e}. Showing original ordering.")
+    #     reranked = hits_for_rerank
+    for m in reranked:
         r = format_hit(m)
-        # st.info(f"Raw match: {r}")
         st.write(f"**Match — {r['id']} (score {r['score']:.4f})**")
         cols = st.columns([1,2])
         with cols[0]:
@@ -222,6 +251,7 @@ def main():
     w_txt = st.sidebar.slider("Text weight", 0.0, 1.0, 0.4)
     only_disagreements = st.sidebar.checkbox("Only cases with radiologist disagreement (uncertainty-focused)")
     show_debug = st.sidebar.checkbox("Show index debug info")
+    rerank_alpha = st.sidebar.slider("Rerank alpha (image vs text)", 0.0, 1.0, 0.5)
     st.sidebar.markdown("---")
     txt = st.text_area("Clinical findings / report text (optional)")
     uploaded_file = st.file_uploader("Upload CT/X-ray/MRI image (optional)", type=["png","jpg","jpeg","tiff","dcm"])
@@ -264,7 +294,7 @@ def main():
         except Exception as e:
             st.error(f"Query failed: {e}")
             return
-        render_results(res)
+        render_results(res, img_emb, txt_emb, rerank_alpha)
 
 if __name__ == "__main__":
     main()
